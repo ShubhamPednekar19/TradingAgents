@@ -63,3 +63,19 @@ def test_seen_state_round_trip(tmp_path):
     path = tmp_path / "seen.json"
     kite.save_seen({"NSE:1"}, path)
     assert kite.load_seen(path) == {"NSE:1"}
+
+
+def test_code_from_redirect():
+    assert kite.code_from_redirect("http://localhost:8765/callback?code=abc&state=xyz") == ("abc", "xyz", None)
+    with pytest.raises(kite.KiteError, match="denied"):
+        kite.code_from_redirect("http://localhost:8765/callback?error=access_denied&error_description=denied")
+
+
+def test_token_storage_round_trip(tmp_path):
+    from mcp.shared.auth import OAuthToken
+
+    store = kite.FileTokenStorage(tmp_path / "oauth.json")
+    assert asyncio.run(store.get_tokens()) is None
+    asyncio.run(store.set_tokens(OAuthToken(access_token="t", token_type="Bearer")))
+    assert asyncio.run(store.get_tokens()).access_token == "t"
+    assert (tmp_path / "oauth.json").stat().st_mode & 0o077 == 0

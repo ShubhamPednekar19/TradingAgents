@@ -195,14 +195,154 @@ def save_seen(seen: set[str], path: Path | None = None) -> None:
     path.write_text(json.dumps({"day": time.strftime("%Y-%m-%d"), "keys": sorted(seen)}), encoding="utf-8")
 
 
+def _print_url(url: str) -> None:
+    print("Open this link to log in to Kite:\n  " + url + "\n"
+          "If the page you land on does not load (the browser is on another machine), "
+          "copy its full address from the address bar and paste it here.", flush=True)
+
+
+# ---------------------------------------------------------------- OAuth sign-in
+#
+# The hosted server asks for MCP OAuth (PKCE, dynamic client registration):
+# you log in on Kite's page, and the browser is redirected to a localhost URL
+# carrying a one-time code. A small local server catches that redirect; where
+# the browser runs on another machine, paste the redirected URL instead.
+
+OAUTH_PORT = int(os.getenv("TRADINGAGENTS_KITE_OAUTH_PORT", "8765"))
+REDIRECT_URI = f"http://localhost:{OAUTH_PORT}/callback"
+
+
+def _oauth_path() -> Path:
+    return Path.home() / ".tradingagents" / "kite_oauth.json"
+
+
+class FileTokenStorage:
+    """Keeps the OAuth client registration and tokens in a private file between runs."""
+
+    def __init__(self, path: Path | None = None):
+        self.path = path or _oauth_path()
+
+    def _read(self) -> dict:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write(self, key: str, value: dict) -> None:
+        data = self._read()
+        data[key] = value
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        self.path.chmod(0o600)
+
+    async def get_tokens(self):
+        from mcp.shared.auth import OAuthToken
+        raw = self._read().get("tokens")
+        return OAuthToken.model_validate(raw) if raw else None
+
+    async def set_tokens(self, tokens) -> None:
+        self._write("tokens", tokens.model_dump(mode="json", exclude_none=True))
+
+    async def get_client_info(self):
+        from mcp.shared.auth import OAuthClientInformationFull
+        raw = self._read().get("client")
+        return OAuthClientInformationFull.model_validate(raw) if raw else None
+
+    async def set_client_info(self, client_info) -> None:
+        self._write("client", client_info.model_dump(mode="json", exclude_none=True))
+
+
+def code_from_redirect(url: str) -> tuple[str, str | None, str | None]:
+    """The code, state and issuer from the URL the browser was redirected to."""
+    from urllib.parse import parse_qs, urlparse
+    query = parse_qs(urlparse(url.strip()).query)
+    if "code" not in query:
+        error = query.get("error_description") or query.get("error") or ["no code in that URL"]
+        raise KiteError(f"Kite sign-in failed: {error[0]}")
+    return query["code"][0], query.get("state", [None])[0], query.get("iss", [None])[0]
+
+
+async def _wait_for_redirect(timeout: float = 600) -> str:
+    """The first redirected URL to arrive, at the local callback server or pasted on stdin."""
+    import sys
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    loop = asyncio.get_running_loop()
+    got: asyncio.Future[str] = loop.create_future()
+
+    def deliver(url: str) -> None:
+        if not got.done():
+            got.set_result(url)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server API
+            if not self.path.startswith("/callback"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            loop.call_soon_threadsafe(deliver, f"http://localhost:{OAUTH_PORT}{self.path}")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Kite sign-in done. You can close this tab.")
+
+        def log_message(self, *args):
+            pass
+
+    server = None
+    try:
+        server = HTTPServer(("127.0.0.1", OAUTH_PORT), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    except OSError as exc:
+        logger.warning("local sign-in callback unavailable on port %s: %s", OAUTH_PORT, exc)
+
+    def read_stdin() -> None:
+        for line in sys.stdin:
+            if "code=" in line or "error=" in line:
+                loop.call_soon_threadsafe(deliver, line.strip())
+                return
+
+    threading.Thread(target=read_stdin, daemon=True).start()
+    try:
+        return await asyncio.wait_for(got, timeout)
+    except TimeoutError:
+        raise KiteNotLoggedIn("Kite sign-in was not completed in time") from None
+    finally:
+        if server:
+            server.shutdown()
+
+
+def _oauth(server_url: str, on_url: Callable[[str], None]):
+    from mcp.client.auth import AuthorizationCodeResult, OAuthClientProvider
+    from mcp.shared.auth import OAuthClientMetadata
+
+    async def redirect(url: str) -> None:
+        on_url(url)
+
+    async def callback() -> AuthorizationCodeResult:
+        code, state, iss = code_from_redirect(await _wait_for_redirect())
+        return AuthorizationCodeResult(code=code, state=state, iss=iss)
+
+    metadata = OAuthClientMetadata(
+        client_name="TradingAgents (read-only)",
+        redirect_uris=[REDIRECT_URI],
+        grant_types=["authorization_code", "refresh_token"],
+        response_types=["code"],
+        token_endpoint_auth_method="none",
+    )
+    return OAuthClientProvider(server_url, metadata, FileTokenStorage(), redirect, callback)
+
+
 # ---------------------------------------------------------------- MCP client
 
 
 class KiteMCP:
     """One MCP session with the Kite server. Its Kite login lives as long as the session."""
 
-    def __init__(self, url: str | None = None):
+    def __init__(self, url: str | None = None, on_url: Callable[[str], None] | None = None):
         self.url = url or kite_mcp_url()
+        self.on_url = on_url or _print_url
         self._stack: AsyncExitStack | None = None
         self._session = None
 
@@ -210,15 +350,20 @@ class KiteMCP:
         try:
             from mcp import ClientSession
             from mcp.client.streamable_http import streamable_http_client
+            from mcp.shared._httpx_utils import create_mcp_http_client
         except ImportError as exc:  # pragma: no cover - depends on the install
             raise KiteError('the Kite integration needs the MCP client: pip install "tradingagents[kite]"') from exc
         self._stack = AsyncExitStack()
         try:
-            read, write = await self._stack.enter_async_context(streamable_http_client(self.url))
+            http = await self._stack.enter_async_context(
+                create_mcp_http_client(auth=_oauth(self.url, self.on_url)))
+            read, write = await self._stack.enter_async_context(streamable_http_client(self.url, http_client=http))
             self._session = await self._stack.enter_async_context(ClientSession(read, write))
             await self._session.initialize()
         except BaseException as exc:
             await self._stack.aclose()
+            if isinstance(exc, KiteError):
+                raise
             raise KiteError(f"could not reach the Kite MCP server at {self.url}: {exc}") from exc
         return self
 
@@ -247,13 +392,13 @@ class KiteMCP:
         except KiteError:
             return False
 
-    async def login(self, on_url: Callable[[str], None], timeout: float = 300, poll: float = 5) -> None:
-        """Ask for a Kite login link, hand it to ``on_url``, and wait until the login completes."""
+    async def login(self, timeout: float = 300, poll: float = 5) -> None:
+        """Make sure Kite is logged in. OAuth sign-in usually does it; otherwise ask for a login link."""
         if await self.is_logged_in():
             return
         text = await self.call_text("login")
         match = _URL.search(text)
-        on_url(match.group(0) if match else text)
+        self.on_url(match.group(0) if match else text)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             await asyncio.sleep(poll)
@@ -278,13 +423,9 @@ class KiteMCP:
 # ---------------------------------------------------------------- entry points
 
 
-def _print_url(url: str) -> None:
-    print(f"Open this link to log in to Kite, then come back here:\n  {url}", flush=True)
-
-
 async def _fetch_portfolio(on_url: Callable[[str], None]) -> PortfolioContext:
-    async with KiteMCP() as kite:
-        await kite.login(on_url)
+    async with KiteMCP(on_url=on_url) as kite:
+        await kite.login()
         return await kite.portfolio()
 
 
@@ -299,11 +440,12 @@ async def _watch(notifiers: list[Notifier], interval: float, alert_existing: boo
     polls = 0
     while max_polls is None or polls < max_polls:
         try:
-            async with KiteMCP() as kite:
-                def announce(url: str) -> None:
-                    on_url(url)
-                    broadcast(f"Kite login needed for trade alerts: {url}", [n for n in notifiers if n is not console_notifier])
-                await kite.login(announce)
+            def announce(url: str) -> None:
+                on_url(url)
+                broadcast(f"Kite login needed for trade alerts: {url}", [n for n in notifiers if n is not console_notifier])
+
+            async with KiteMCP(on_url=announce) as kite:
+                await kite.login()
                 while max_polls is None or polls < max_polls:
                     polls += 1
                     fresh = new_trades(await kite.trades(), seen)
