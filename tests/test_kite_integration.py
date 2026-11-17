@@ -9,6 +9,7 @@ def test_yahoo_symbol_maps_indian_exchanges():
     assert kite.yahoo_symbol("reliance", "NSE") == "RELIANCE.NS"
     assert kite.yahoo_symbol("TCS", "BSE") == "TCS.BO"
     assert kite.yahoo_symbol("NIFTY25NOVFUT", "NFO") == "NIFTY25NOVFUT"
+    assert kite.yahoo_symbol("HFCL-BE", "NSE") == "HFCL.NS"
 
 
 def test_parse_payload_unwraps_pages():
@@ -23,8 +24,10 @@ def test_portfolio_from_kite():
         {"tradingsymbol": "INFY", "exchange": "NSE", "quantity": 10, "t1_quantity": 2, "average_price": 1500.0},
         {"tradingsymbol": "SOLD", "exchange": "NSE", "quantity": 0, "t1_quantity": 0, "average_price": 1.0},
     ]
-    positions = {"net": [{"tradingsymbol": "SBIN", "exchange": "BSE", "quantity": -5, "average_price": 800.0}],
-                 "day": []}
+    positions = [{"tradingsymbol": "SBIN", "exchange": "BSE", "quantity": -5, "average_price": 800.0, "view": "net"},
+                 {"tradingsymbol": "SBIN", "exchange": "BSE", "quantity": -5, "average_price": 800.0, "view": "day"}]
+    # A delivery sale of a holding today: holdings already show it, so the -3 must not count again.
+    positions.append({"tradingsymbol": "KANOHAR", "exchange": "NSE", "quantity": -3, "product": "CNC", "view": "net"})
     margins = {"equity": {"net": 12345.5}, "commodity": {"net": 0}}
     book = kite.portfolio_from_kite(holdings, positions, margins)
     assert book.cash == 12345.5 and book.currency == "INR"
@@ -44,9 +47,10 @@ def test_new_trades_dedupes_and_formats():
 
 def test_client_refuses_order_tools():
     client = kite.KiteMCP("http://unused")
-    for tool in ("place_order", "modify_order", "cancel_order", "place_gtt_order", "delete_gtt_order"):
+    for tool, mode in [("orders", "place"), ("orders", "modify"), ("orders", "cancel"),
+                       ("gtt", "place"), ("alerts", "create"), ("session", "logout"), ("orders", "permissions")]:
         with pytest.raises(kite.KiteError, match="read-only"):
-            asyncio.run(client.call_text(tool))
+            asyncio.run(client.call_text(tool, mode))
 
 
 def test_broadcast_survives_a_failing_channel():

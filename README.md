@@ -330,7 +330,7 @@ An empty `positions` list means a flat book, which is different from passing not
 
 #### Zerodha Kite (read-only)
 
-Your Kite book can be read through Zerodha's official [Kite MCP server](https://github.com/zerodha/kite-mcp-server). The client calls only read tools and refuses order tools (`place_order`, `modify_order`, `cancel_order`, GTT changes), so it cannot trade. You log in on Kite's own page, and no API key is needed for the hosted server.
+Your Kite book can be read through Zerodha's official [Kite MCP server](https://github.com/zerodha/kite-mcp-server). The client calls only read modes (holdings, positions, margins, orders and trades lists) and refuses everything else, including placing, modifying and cancelling orders, so it cannot trade. You sign in on Kite's own page, and no API key is needed for the hosted server. The sign-in opens a `localhost:8765` callback that the CLI catches; if your browser is on another machine, paste the address it lands on into the CLI.
 
 ```bash
 pip install "tradingagents[kite]"
@@ -340,7 +340,7 @@ tradingagents --portfolio kite_portfolio.json --ticker RELIANCE.NS
 
 NSE and BSE symbols are saved with Yahoo's `.NS` and `.BO` suffixes, so they match the tickers you analyze.
 
-`tradingagents kite watch` checks your executed trades every 30 seconds (`--interval`) and sends an alert for each new one. By default the alerts appear in the console. Set `TRADINGAGENTS_TELEGRAM_BOT_TOKEN` and `TRADINGAGENTS_TELEGRAM_CHAT_ID` for Telegram, or `TRADINGAGENTS_ALERT_WEBHOOK_URL` for Slack, Discord or any JSON webhook. Kite sessions end each morning. The watcher then sends a new login link through the same channels. Set `TRADINGAGENTS_KITE_MCP_URL` to use a self-hosted server.
+`tradingagents kite watch` checks your executed trades every 30 seconds (`--interval`) and sends an alert for each new one. By default the alerts appear in the console. Set `TRADINGAGENTS_TELEGRAM_BOT_TOKEN` and `TRADINGAGENTS_TELEGRAM_CHAT_ID` for Telegram, or `TRADINGAGENTS_ALERT_WEBHOOK_URL` for Slack, Discord or any JSON webhook. Kite sessions end each morning at 6 AM IST. The watcher then sends a new sign-in link through the same channels. Set `TRADINGAGENTS_KITE_MCP_URL` to use a self-hosted server.
 
 ## Persistence and Recovery
 

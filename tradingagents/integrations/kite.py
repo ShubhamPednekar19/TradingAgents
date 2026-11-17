@@ -8,11 +8,11 @@ Two uses:
 * ``watch_trades`` polls your executed trades and sends an alert for each new
   one (console, Telegram, webhook; see ``alerts``).
 
-Read-only by construction: the client calls only the tools in
-``READ_ONLY_TOOLS`` and refuses every other name, so nothing here can place,
-modify or cancel an order, whatever the server offers. The hosted server at
-https://mcp.kite.trade/mcp needs no API key; you log in through Kite's own
-page, so your credentials never pass through this code. Point
+Read-only by construction: the client calls only the tool modes in
+``READ_ONLY_MODES`` and refuses every other one, so nothing here can place,
+modify or cancel an order, whatever the server offers. You sign in on
+Kite's own page (MCP OAuth), so your password never passes through this
+code; the tokens are kept in ``~/.tradingagents/kite_oauth.json``. Point
 ``TRADINGAGENTS_KITE_MCP_URL`` at a self-hosted server to use your own
 Kite Connect app instead.
 
@@ -39,30 +39,17 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_KITE_MCP_URL = "https://mcp.kite.trade/mcp"
 
-# The only tools this client will ever call. Order tools (place_order,
-# modify_order, cancel_order, *_gtt_order) are absent on purpose.
-READ_ONLY_TOOLS = frozenset(
-    {
-        "login",
-        "get_profile",
-        "get_margins",
-        "get_holdings",
-        "get_positions",
-        "get_orders",
-        "get_trades",
-        "get_order_history",
-        "get_order_trades",
-        "get_gtts",
-        "get_ltp",
-        "get_quotes",
-    }
-)
+# The only (tool, mode) pairs this client will ever call. The server's
+# ``orders`` tool also places, modifies and cancels orders, so the guard is on
+# the mode, not just the tool name; any mode not listed here is refused.
+READ_ONLY_MODES = {
+    "portfolio": frozenset({"profile", "margins", "holdings", "positions"}),
+    "orders": frozenset({"list", "history", "trades", "all_trades"}),
+    "session": frozenset({"status"}),
+}
 
 # Kite exchange -> the suffix Yahoo Finance (the default data vendor) uses.
 _YAHOO_SUFFIX = {"NSE": ".NS", "BSE": ".BO"}
-
-_URL = re.compile(r"https?://[^\s\"'<>)\]]+")
-
 
 class KiteError(RuntimeError):
     pass
@@ -79,11 +66,15 @@ def kite_mcp_url() -> str:
     return os.getenv("TRADINGAGENTS_KITE_MCP_URL", "").strip() or DEFAULT_KITE_MCP_URL
 
 
+# NSE trading-series tags Kite appends (HFCL-BE); Yahoo lists the plain symbol.
+_SERIES = re.compile(r"-(BE|BZ|BL|BT|SM|ST|IL|GB|GS|IT|RR|EQ)$")
+
+
 def yahoo_symbol(tradingsymbol: str, exchange: str | None) -> str:
     """RELIANCE on NSE -> RELIANCE.NS. Derivatives and other venues keep Kite's spelling."""
     suffix = _YAHOO_SUFFIX.get((exchange or "").upper())
     symbol = tradingsymbol.strip().upper()
-    return symbol + suffix if suffix else symbol
+    return _SERIES.sub("", symbol) + suffix if suffix else symbol
 
 
 def parse_payload(text: str) -> Any:
@@ -133,10 +124,15 @@ def portfolio_from_kite(holdings: Any, positions: Any, margins: Any = None) -> P
                 quantity=qty,
                 average_price=row.get("average_price"),
             ))
-    net = positions.get("net", []) if isinstance(positions, dict) else positions
-    for row in _rows(net):
+    if isinstance(positions, dict):  # older shape: {"net": [...], "day": [...]}
+        positions = positions.get("net", [])
+    # Rows carry view=day (today's activity) or view=net (current exposure); only net is the book.
+    for row in (r for r in _rows(positions) if r.get("view", "net") == "net"):
         qty = float(row.get("quantity") or 0)
-        # CNC positions already show up in holdings from T+1; today's are not there yet.
+        # Kite deducts today's delivery (CNC) sells from holdings already, so they
+        # would count twice; today's CNC buys reach holdings only from the next day.
+        if row.get("product") == "CNC" and qty < 0:
+            continue
         if qty:
             book.append(Position(
                 ticker=yahoo_symbol(row["tradingsymbol"], row.get("exchange")),
@@ -371,62 +367,62 @@ class KiteMCP:
         if self._stack:
             await self._stack.aclose()
 
-    async def call_text(self, tool: str, arguments: dict | None = None) -> str:
-        if tool not in READ_ONLY_TOOLS:
-            raise KiteError(f"refusing to call {tool!r}: this integration is read-only")
-        result = await self._session.call_tool(tool, arguments or {})
+    async def call_text(self, tool: str, mode: str, **arguments: Any) -> str:
+        if mode not in READ_ONLY_MODES.get(tool, ()):
+            raise KiteError(f"refusing to call {tool} mode={mode}: this integration is read-only")
+        result = await self._session.call_tool(tool, {"mode": mode, **arguments})
         text = "\n".join(getattr(part, "text", "") for part in result.content).strip()
-        if result.isError:
-            if re.search(r"log ?in|session|token|auth", text, re.IGNORECASE):
+        if getattr(result, "is_error", None) or getattr(result, "isError", False):
+            if re.search(r"log ?in|session|token|auth|expired", text, re.IGNORECASE):
                 raise KiteNotLoggedIn(text)
-            raise KiteError(f"{tool} failed: {text}")
+            raise KiteError(f"{tool} {mode} failed: {text}")
         return text
 
-    async def call(self, tool: str, arguments: dict | None = None) -> Any:
-        return parse_payload(await self.call_text(tool, arguments))
+    async def call(self, tool: str, mode: str, **arguments: Any) -> Any:
+        return parse_payload(await self.call_text(tool, mode, **arguments))
 
-    async def is_logged_in(self) -> bool:
-        try:
-            await self.call("get_profile")
-            return True
-        except KiteError:
-            return False
-
-    async def login(self, timeout: float = 300, poll: float = 5) -> None:
-        """Make sure Kite is logged in. OAuth sign-in usually does it; otherwise ask for a login link."""
-        if await self.is_logged_in():
-            return
-        text = await self.call_text("login")
-        match = _URL.search(text)
-        self.on_url(match.group(0) if match else text)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            await asyncio.sleep(poll)
-            if await self.is_logged_in():
-                return
-        raise KiteNotLoggedIn("Kite login was not completed in time")
+    async def login(self) -> None:
+        """Fail with KiteNotLoggedIn when the Kite login behind the sign-in has expired (daily, 6 AM IST)."""
+        status = await self.call("session", "status")
+        if not status.get("authenticated") or status.get("kite_session_expired"):
+            raise KiteNotLoggedIn("Kite session expired")
 
     async def portfolio(self) -> PortfolioContext:
-        holdings = await self.call("get_holdings")
-        positions = await self.call("get_positions")
+        holdings = await self.call("portfolio", "holdings", limit=500)
+        positions = await self.call("portfolio", "positions", limit=500)
         try:
-            margins = await self.call("get_margins")
+            margins = await self.call("portfolio", "margins")
         except KiteError as exc:
             logger.warning("margins unavailable, cash left unset: %s", exc)
             margins = None
         return portfolio_from_kite(holdings, positions, margins)
 
     async def trades(self) -> list[dict]:
-        return _rows(await self.call("get_trades"))
+        return _rows(await self.call("orders", "all_trades", limit=500))
 
 
 # ---------------------------------------------------------------- entry points
 
 
+def forget_sign_in() -> None:
+    """Drop the stored tokens so the next connection signs in to Kite afresh."""
+    storage = FileTokenStorage()
+    data = storage._read()
+    if data.pop("tokens", None) is not None:
+        storage.path.write_text(json.dumps(data), encoding="utf-8")
+
+
 async def _fetch_portfolio(on_url: Callable[[str], None]) -> PortfolioContext:
-    async with KiteMCP(on_url=on_url) as kite:
-        await kite.login()
-        return await kite.portfolio()
+    for attempt in (1, 2):
+        try:
+            async with KiteMCP(on_url=on_url) as kite:
+                await kite.login()
+                return await kite.portfolio()
+        except KiteNotLoggedIn:
+            if attempt == 2:
+                raise
+            forget_sign_in()
+    raise AssertionError("unreachable")
 
 
 def fetch_portfolio(on_url: Callable[[str], None] = _print_url) -> PortfolioContext:
@@ -458,8 +454,9 @@ async def _watch(notifiers: list[Notifier], interval: float, alert_existing: boo
                     save_seen(seen)
                     await asyncio.sleep(interval)
         except KiteNotLoggedIn as exc:
-            # Kite sessions end daily (around 6 AM IST); reconnect and log in again.
+            # Kite sessions end daily (6 AM IST); sign in afresh, which sends a new link.
             logger.warning("Kite session ended: %s", exc)
+            forget_sign_in()
         except Exception as exc:  # noqa: BLE001 - a network blip must not end the watch
             logger.warning("Kite watch error, retrying in %ss: %s", interval, exc)
             await asyncio.sleep(interval)
