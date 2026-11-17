@@ -196,3 +196,48 @@ def logout(plan: Annotated[Plan, typer.Argument(help="The plan to sign out of")]
 
 if __name__ == "__main__":
     app()
+
+
+kite_app = typer.Typer(help="Zerodha Kite (read-only, via the official Kite MCP server)")
+app.add_typer(kite_app, name="kite")
+
+
+@kite_app.command("portfolio")
+def kite_portfolio(
+    out: str = typer.Option("kite_portfolio.json", "--out", help="Where to write the portfolio JSON"),
+):
+    """Log in to Kite and save your holdings, positions and free margin for --portfolio."""
+    from tradingagents.integrations.kite import KiteError, fetch_portfolio
+
+    try:
+        book = fetch_portfolio()
+    except KiteError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
+    from pathlib import Path
+
+    Path(out).write_text(book.model_dump_json(indent=2), encoding="utf-8")
+    console.print(f"Saved {len(book.positions)} position(s) to {escape(out)}; "
+                  f"run: tradingagents --portfolio {escape(out)}")
+
+
+@kite_app.command("watch")
+def kite_watch(
+    interval: float = typer.Option(30, "--interval", help="Seconds between checks for new trades"),
+    alert_existing: bool = typer.Option(
+        False, "--alert-existing", help="Also alert on trades already executed today when the watch starts"
+    ),
+):
+    """Alert on every new Kite trade (console, plus Telegram / webhook if configured)."""
+    from tradingagents.integrations.alerts import notifiers_from_env
+    from tradingagents.integrations.kite import watch_trades
+
+    notifiers = notifiers_from_env()
+    if len(notifiers) == 1:
+        console.print("[yellow]Alerts go to this console only; set TRADINGAGENTS_TELEGRAM_BOT_TOKEN and "
+                      "TRADINGAGENTS_TELEGRAM_CHAT_ID, or TRADINGAGENTS_ALERT_WEBHOOK_URL, for phone alerts.[/yellow]")
+    console.print(f"Watching Kite trades every {interval:g}s. Ctrl+C to stop.")
+    try:
+        watch_trades(notifiers, interval=interval, alert_existing=alert_existing)
+    except KeyboardInterrupt:
+        console.print("Stopped.")

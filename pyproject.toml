@@ -41,6 +41,10 @@ dev = [
 bedrock = [
     "langchain-aws>=1.7.9",
 ]
+# Zerodha Kite through its read-only MCP server: pip install "tradingagents[kite]".
+kite = [
+    "mcp>=1.10",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"
